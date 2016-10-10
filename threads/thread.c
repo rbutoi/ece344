@@ -252,14 +252,11 @@ thread_yield(Tid want_tid)
 
 	assert(valid_thd(want_tid));
 
-	/* volatile int setcontext_called = 0; */
 	setcontext_called = 0;
 	int ret = getcontext( &tcbs[ thread_id() ].ctx );
 	assert(!ret);
-	/* printf("setcontext_called = %d\n", setcontext_called); */
 
 	if (setcontext_called) {
-		// 
 		return want_tid;
 	}
 
@@ -267,7 +264,6 @@ thread_yield(Tid want_tid)
 	curr_th = want_tid;
 	ret = setcontext( &tcbs[ want_tid ].ctx );
 
-	// shouldn't reach
 	assert(!ret);
 	assert(0 && "BADNESS");
 	return THREAD_FAILED;
@@ -283,7 +279,6 @@ thread_exit()
 	q_enq(&kill_q, thread_id());
 	thread_yield(THREAD_ANY);
 
-	// sholdn't run
 	assert(0);
 	return THREAD_FAILED;
 }
