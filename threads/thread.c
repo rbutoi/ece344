@@ -131,6 +131,8 @@ thread_stub(void (*thread_main)(void *), void *arg)
 {
 	Tid ret;
 
+	interrupts_set(1);
+
 	thread_main(arg); // call thread_main() function with arg
 	ret = thread_exit();
 	// we should only get here if we are the last thread. 
@@ -170,6 +172,8 @@ thread_id()
 Tid
 thread_create(void (*fn) (void *), void *parg)
 {
+	int enabled = interrupts_off();
+
 	Tid tid = find_first_unused_tid();
 	if (tid == THREAD_NOMORE) {
 		return tid;
@@ -203,13 +207,17 @@ thread_create(void (*fn) (void *), void *parg)
 
 	// add to ready Q
 	q_enq(&ready_q, tid);
-	
+
+	interrupts_set(enabled);
+
 	return tid;
 }
 
 Tid
 thread_yield(Tid want_tid)
 {
+	int enabled = interrupts_off();
+
 	// delete shit if possible. for kill_thread
 	if (!q_empty(&kill_q)) {
 		int self_found = 0;
@@ -257,6 +265,7 @@ thread_yield(Tid want_tid)
 	assert(!ret);
 
 	if (setcontext_called) {
+		interrupts_set(enabled);
 		return want_tid;
 	}
 
@@ -276,7 +285,10 @@ thread_exit()
 		return THREAD_NONE;
 	}
 
+	int enabled = interrupts_off();
 	q_enq(&kill_q, thread_id());
+	interrupts_set(enabled);
+
 	thread_yield(THREAD_ANY);
 
 	assert(0);
@@ -290,7 +302,9 @@ thread_kill(Tid tid)
 		return THREAD_INVALID;
 	}
 
+	int enabled = interrupts_off();
 	q_enq(&kill_q, tid);
+	interrupts_set(enabled);
 
 	return tid;
 }
@@ -301,7 +315,7 @@ thread_kill(Tid tid)
 
 /* This is the wait queue structure */
 struct wait_queue {
-	/* ... Fill this in ... */
+	circular_q q;
 };
 
 struct wait_queue *
@@ -312,7 +326,7 @@ wait_queue_create()
 	wq = malloc(sizeof(struct wait_queue));
 	assert(wq);
 
-	TBD();
+	q_init(&wq->q);
 
 	return wq;
 }
