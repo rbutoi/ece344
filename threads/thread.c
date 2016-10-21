@@ -1,3 +1,4 @@
+#include <valgrind/valgrind.h>
 #include <assert.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -131,7 +132,7 @@ thread_stub(void (*thread_main)(void *), void *arg)
 {
 	Tid ret;
 
-	interrupts_set(1);
+	interrupts_on();
 
 	thread_main(arg); // call thread_main() function with arg
 	ret = thread_exit();
@@ -148,6 +149,8 @@ void thread_destroy(Tid tid)
 	free(tcbs[tid].stack);
 	tcbs[tid].alive = 0;;
 }
+
+Tid actually_call_setcontext(Tid want_tid, int interrupts_enabled);
 
 // thread API funcs
 void
@@ -176,6 +179,7 @@ thread_create(void (*fn) (void *), void *parg)
 
 	Tid tid = find_first_unused_tid();
 	if (tid == THREAD_NOMORE) {
+		interrupts_set(enabled);
 		return tid;
 	}
 
@@ -186,7 +190,9 @@ thread_create(void (*fn) (void *), void *parg)
 	// make stack
 	// + 8 is for 1/2 of 16, to snap to alignment
 	void *stack = tcbs[tid].stack = malloc(THREAD_MIN_STACK + 8);
+	VALGRIND_STACK_REGISTER(stack, stack + THREAD_MIN_STACK + 8);
 	if (!stack) {
+		interrupts_set(enabled);
 		return THREAD_NOMEMORY;
 	}
 
@@ -239,9 +245,12 @@ thread_yield(Tid want_tid)
 
 	switch (want_tid) {
 	case THREAD_ANY:
-		if (q_empty(&ready_q) ||
-			(q_size(&ready_q) == 1 && ready_q.q[ready_q.start] == thread_id())) {
+		if (q_empty(&ready_q)) {
+			interrupts_set(enabled);
 			return THREAD_NONE;
+		}
+		if (q_size(&ready_q) == 1 && ready_q.q[ready_q.start] == thread_id()) {
+			assert(0);
 		}
 
 		// yield to top thread in queue
@@ -253,11 +262,16 @@ thread_yield(Tid want_tid)
 		break;
 	default:
 		if (!valid_thd(want_tid) || !tcbs[want_tid].alive) {
+			interrupts_set(enabled);
 			return THREAD_INVALID;
 		}
 		q_replace_once(&ready_q, want_tid, thread_id());
 	}
+	return actually_call_setcontext(want_tid, enabled);
+}
 
+Tid actually_call_setcontext(Tid want_tid, int interrupts_enabled)
+{
 	assert(valid_thd(want_tid));
 
 	setcontext_called = 0;
@@ -265,7 +279,7 @@ thread_yield(Tid want_tid)
 	assert(!ret);
 
 	if (setcontext_called) {
-		interrupts_set(enabled);
+		interrupts_set(interrupts_enabled);
 		return want_tid;
 	}
 
@@ -281,31 +295,35 @@ thread_yield(Tid want_tid)
 Tid
 thread_exit()
 {
+	int enabled = interrupts_off();
+
 	if (q_empty(&ready_q)) {
+		interrupts_set(enabled);
 		return THREAD_NONE;
 	}
 
-	int enabled = interrupts_off();
 	q_enq(&kill_q, thread_id());
-	interrupts_set(enabled);
 
-	thread_yield(THREAD_ANY);
+	// yield to any thread
+	Tid want_tid = q_deq(&ready_q);
+	q_enq(&ready_q, thread_id());
 
-	assert(0);
-	return THREAD_FAILED;
+	return actually_call_setcontext(want_tid, enabled);
 }
 
 Tid
 thread_kill(Tid tid)
 {
+	int enabled = interrupts_off();
+
 	if (tid == thread_id() || !valid_thd(tid) || !tcbs[tid].alive) {
+		interrupts_set(enabled);
 		return THREAD_INVALID;
 	}
 
-	int enabled = interrupts_off();
 	q_enq(&kill_q, tid);
-	interrupts_set(enabled);
 
+	interrupts_set(enabled);
 	return tid;
 }
 
@@ -334,15 +352,29 @@ wait_queue_create()
 void
 wait_queue_destroy(struct wait_queue *wq)
 {
-	TBD();
+	assert(q_empty(&wq->q));
+
 	free(wq);
 }
 
 Tid
 thread_sleep(struct wait_queue *queue)
 {
-	TBD();
-	return THREAD_FAILED;
+	int enabled = interrupts_off();
+
+	if (!queue) {
+		interrupts_set(enabled);
+		return THREAD_INVALID;
+	}
+
+	if (q_empty(&ready_q)) {
+		interrupts_set(enabled);
+		return THREAD_NONE;
+	}
+
+	Tid want_tid = q_deq(&ready_q);
+	q_enq(&queue->q, thread_id());
+	return actually_call_setcontext(want_tid, enabled);
 }
 
 /* when the 'all' parameter is 1, wakeup all threads waiting in the queue.
@@ -350,12 +382,35 @@ thread_sleep(struct wait_queue *queue)
 int
 thread_wakeup(struct wait_queue *queue, int all)
 {
-	TBD();
-	return 0;
+	int enabled = interrupts_off();
+
+	int n = 0;
+	if (!queue) {
+		interrupts_set(enabled);
+		return 0;
+	}
+
+	if (all) {
+		while (!q_empty(&queue->q)) {
+			q_enq(&ready_q, q_deq(&queue->q));
+			++n;
+		}
+	} else {
+		if (!q_empty(&queue->q)) {
+			q_enq(&ready_q, q_deq(&queue->q));
+			++n;
+		}
+	}
+
+	interrupts_set(enabled);
+
+	return n;
 }
 
 struct lock {
-	/* ... Fill this in ... */
+	struct wait_queue q;
+	int avail;
+	Tid who;
 };
 
 struct lock *
@@ -366,7 +421,8 @@ lock_create()
 	lock = malloc(sizeof(struct lock));
 	assert(lock);
 
-	TBD();
+	q_init(&lock->q.q);
+	lock->avail = 1;
 
 	return lock;
 }
@@ -374,31 +430,54 @@ lock_create()
 void
 lock_destroy(struct lock *lock)
 {
+	int enabled = interrupts_off();
+
 	assert(lock != NULL);
 
-	TBD();
+	assert(lock->avail);
+	/* => */
+	assert(q_empty(&lock->q.q));
 
 	free(lock);
+
+	interrupts_set(enabled);
 }
 
 void
 lock_acquire(struct lock *lock)
 {
+	int enabled = interrupts_off();
+
 	assert(lock != NULL);
 
-	TBD();
+	while (!lock->avail) {
+		thread_sleep(&lock->q);
+	}
+
+	lock->avail = 0;
+	lock->who = thread_id();
+
+	interrupts_set(enabled);
 }
 
 void
 lock_release(struct lock *lock)
 {
+	int enabled = interrupts_off();
+
 	assert(lock != NULL);
 
-	TBD();
+	assert(!lock->avail);
+	assert(lock->who == thread_id());
+
+	lock->avail = 1;
+	thread_wakeup(&lock->q, 1);
+
+	interrupts_set(enabled);
 }
 
 struct cv {
-	/* ... Fill this in ... */
+	struct wait_queue q;
 };
 
 struct cv *
@@ -409,7 +488,7 @@ cv_create()
 	cv = malloc(sizeof(struct cv));
 	assert(cv);
 
-	TBD();
+	q_init(&cv->q.q);
 
 	return cv;
 }
@@ -419,7 +498,7 @@ cv_destroy(struct cv *cv)
 {
 	assert(cv != NULL);
 
-	TBD();
+	assert(q_empty(&cv->q.q));
 
 	free(cv);
 }
@@ -427,26 +506,51 @@ cv_destroy(struct cv *cv)
 void
 cv_wait(struct cv *cv, struct lock *lock)
 {
+	int enabled = interrupts_off();
+
 	assert(cv != NULL);
 	assert(lock != NULL);
 
-	TBD();
+	assert(!lock->avail && lock->who == thread_id());
+
+	lock_release(lock);
+	thread_sleep(&cv->q);
+
+	interrupts_set(enabled);
+
+	lock_acquire(lock);
 }
 
 void
 cv_signal(struct cv *cv, struct lock *lock)
 {
+	int enabled = interrupts_off();
+
 	assert(cv != NULL);
 	assert(lock != NULL);
 
-	TBD();
+	assert(!lock->avail && lock->who == thread_id());
+
+	if (!q_empty(&cv->q.q)) {
+		q_enq(&ready_q, q_deq(&cv->q.q));
+	}
+
+	interrupts_set(enabled);
 }
 
 void
 cv_broadcast(struct cv *cv, struct lock *lock)
 {
+	int enabled = interrupts_off();
+
 	assert(cv != NULL);
 	assert(lock != NULL);
 
-	TBD();
+	assert(!lock->avail && lock->who == thread_id());
+
+	while (!q_empty(&cv->q.q)) {
+		q_enq(&ready_q, q_deq(&cv->q.q));
+	}
+
+	interrupts_set(enabled);
 }
