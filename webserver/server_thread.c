@@ -3,11 +3,6 @@
 #include "server_thread.h"
 #include "common.h"
 
-struct request {
-	int fd;		 /* descriptor for client connection */
-	struct file_data *data;
-};
-
 /* circular Q header */
 
 typedef struct {
@@ -56,7 +51,25 @@ lru_node *make_lru_node(struct file_data *data, lru_node *next);
 void lru_use(struct file_data *data);
 void lru_print();
 
+/* debug */
+int pthread_t_to_small_int(pthread_t pt);
+#define ZEROING_FREE(X)                         \
+    if (X) memset(X, 0, sizeof(*X));            \
+    free(X);                                    \
+    X = NULL;
+#define ZEROING_FREE_STR(X)                     \
+    if (X) memset(X, 0, strlen(X));             \
+    free(X);                                    \
+    X = NULL;
+#ifdef DEBUG
+#define DEBUG_PRINT(FMT, ...)											\
+printf("%d|" FMT "\n", pthread_t_to_small_int(pthread_self()), __VA_ARGS__)
+#else
+#define DEBUG_PRINT(FMT, ...)
+#endif
+
 /* globals */
+pthread_t *threads;
 
 circular_q req_q;
 pthread_mutex_t req_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -96,9 +109,12 @@ file_data_init(void)
 static void
 file_data_free(struct file_data *data)
 {
-	free(data->file_name);
+	ZEROING_FREE_STR(data->file_name);
+	if (data->file_buf) {
+		memset(data->file_buf, 0, data->file_size);
+	}
 	free(data->file_buf);
-	free(data);
+	ZEROING_FREE(data);
 }
 
 static void
@@ -116,40 +132,48 @@ do_server_request(struct server *sv, int connfd)
 		file_data_free(data);
 		return;
 	}
-
-#ifdef DEBUG
-	printf("request for %s\n", data->file_name);
-#endif
+	DEBUG_PRINT("request for %s", data->file_name);
 
 	/* check cache for file */
-
 	pthread_mutex_lock(&cache_lock);
 	node *cached = cache_lookup(data);
 	if (cached) {
-		cached->reading = 1;
-		file_data_free(data);
-		rq->data = cached->data;
-		pthread_mutex_unlock(&cache_lock);
+		DEBUG_PRINT("cache hit, incrementing %d", cached->reading);
+		++cached->reading;
 
-		request_sendfile(rq);
-
-		pthread_mutex_lock(&cache_lock);
 		lru_use(cached->data);
-		cached->reading = 0;
-		pthread_mutex_unlock(&cache_lock);
 
+		free(data->file_name);
+		data->file_name = cached->data->file_name;
+		data->file_buf = cached->data->file_buf;
+		data->file_size = cached->data->file_size;
+
+		pthread_mutex_unlock(&cache_lock);
+		request_sendfile(rq);
+		pthread_mutex_lock(&cache_lock);
+
+		DEBUG_PRINT("cache hit, decrementing %d", cached->reading);
+		assert(cached->reading > 0);
+		--cached->reading;
+
+		ZEROING_FREE(data);
+
+		pthread_mutex_unlock(&cache_lock);
 	} else {
 		pthread_mutex_unlock(&cache_lock);
+
+		DEBUG_PRINT("reading file %s", data->file_name);
 		ret = request_readfile(rq);
-
 		if (ret) {
-			request_sendfile(rq);
-
+			int file_too_big_for_cache = 1;
 			pthread_mutex_lock(&cache_lock);
 			cached = cache_lookup(data);
-			if (!cached) {
-				int file_too_big_for_cache = rq->data->file_size > sv->max_cache_size;
-				int evict_amount = cache_usage + rq->data->file_size - sv->max_cache_size;
+			if (cached) {
+				++cached->reading;
+				lru_use(data);
+			} else {
+				file_too_big_for_cache = data->file_size > sv->max_cache_size;
+				int evict_amount = cache_usage + data->file_size - sv->max_cache_size;
 
 				if (!file_too_big_for_cache && evict_amount > 0) {
 					/* adding would overfill cache, need to evict */
@@ -158,13 +182,34 @@ do_server_request(struct server *sv, int connfd)
 						file_too_big_for_cache = 1;
 					}
 				}
-
 				if (!file_too_big_for_cache) {
-					cache_insert(data);
+					cached = cache_insert(data);
+					DEBUG_PRINT("cache miss, incrementing %d", cached->reading);
+					++cached->reading;
 					lru_use(data);
 				}
 			}
 			pthread_mutex_unlock(&cache_lock);
+
+			DEBUG_PRINT("sending file %s", data->file_name);
+			request_sendfile(rq);
+
+			pthread_mutex_lock(&cache_lock);
+			cached = cache_lookup(data);
+			if (cached) {
+				if (!file_too_big_for_cache) {
+					/* I added to cache */
+					DEBUG_PRINT("cache miss, decrementing %d", cached->reading);
+					assert(cached->reading > 0);
+					--cached->reading;
+				}
+				pthread_mutex_unlock(&cache_lock);
+			} else {
+				pthread_mutex_unlock(&cache_lock);
+				file_data_free(data);
+			}
+		} else {
+			file_data_free(data);
 		}
 	}
 
@@ -191,11 +236,14 @@ server_init(int nr_threads, int max_requests, int max_cache_size)
 
 	q_init(&req_q, max_requests);
 
+	threads = malloc(sizeof(pthread_t) * nr_threads);
+
 	int i;
 	for (i = 0; i < nr_threads; ++i) {
 		pthread_t t;
 		int ret = pthread_create(&t, NULL, &worker, sv);
 		assert(!ret);
+		threads[i] = t;
 	}
 
 	/* cache */
@@ -284,6 +332,8 @@ hash(const char *str, int len)
 node *
 cache_lookup(struct file_data *data)
 {
+	assert(data);
+	assert(data->file_name);
 	int len = strlen(data->file_name);
 	int hash_in_bucket = hash(data->file_name, len) % BUCKETS;
 
@@ -315,6 +365,7 @@ cache_insert(struct file_data *data)
 	cache_usage += data->file_size;
 	*curr = make_node(data, NULL);
 
+	DEBUG_PRINT("cache insert %s", data->file_name);
 	return *curr;
 }
 
@@ -353,14 +404,23 @@ cache_delete(struct file_data *data)
 		/* delete first */
 
 		if ((*head)->reading) {
+#ifdef DEBUG
+			printf("%d|deleting %s, can't do it\n", pthread_t_to_small_int(pthread_self()), data->file_name);
+			//fflush(stdout);
+#endif
 			return -1;
 		}
+
+#ifdef DEBUG
+		printf("%d|deleting %s\n", pthread_t_to_small_int(pthread_self()), data->file_name);
+		//fflush(stdout);
+#endif
 		cache_usage -= (*head)->data->file_size;
 		deleted = (*head)->data->file_size;
 		node *sacrificial = *head;
 		*head = (*head)->next;
 		file_data_free(sacrificial->data);
-		free(sacrificial);
+		ZEROING_FREE(sacrificial);
 	} else {
 		node *prev = *head;
 		node *curr = prev->next;
@@ -375,11 +435,15 @@ cache_delete(struct file_data *data)
 		if (curr->reading) {
 			return -1;
 		}
+#ifdef DEBUG
+		printf("%d|deleting %s\n", pthread_t_to_small_int(pthread_self()), data->file_name);
+		//fflush(stdout);
+#endif
 		prev->next = curr->next;
 		cache_usage -= curr->data->file_size;
 		deleted = curr->data->file_size;
 		file_data_free(curr->data);
-		free(curr);
+		ZEROING_FREE(curr);
 	}
 
 	return deleted;
@@ -390,13 +454,13 @@ int cache_evict(int amount)
 	int deleted;
 	while (lru_list_head && amount > 0) {
 		deleted = cache_delete(lru_list_head->data);
-		if (deleted == -1) continue;
+		if (deleted == -1) break;
+
 		assert(deleted);
 		amount -= deleted;
-
 		lru_node *sacrificial = lru_list_head;
 		lru_list_head = lru_list_head->next;
-		free(sacrificial);
+		ZEROING_FREE(sacrificial);
 	}
 
 	/* if successfully evicted from head, or evicted everything from head */
@@ -409,16 +473,19 @@ int cache_evict(int amount)
 	lru_node *curr = prev->next;
 
 	while (curr && amount > 0) {
+		assert(curr->data);
+		assert(curr->data->file_name);
 		deleted = cache_delete(curr->data);
-		if (deleted == -1) continue;
 		assert(deleted);
 
 		if (deleted != -1) {
 			amount -= deleted;
 
+			lru_node *sacrificial = curr;
 			curr = curr->next;
 			prev->next = curr;
-			free(curr);
+
+			ZEROING_FREE(sacrificial);
 		} else {
 			prev = prev->next;
 			curr = curr->next;
@@ -430,18 +497,19 @@ int cache_evict(int amount)
 
 void cache_print()
 {
-	printf("cache\n");
+	printf("%d|cache\n%d|\t", pthread_t_to_small_int(pthread_self()),
+		   pthread_t_to_small_int(pthread_self()));
 	int i;
 	for (i = 0; i < BUCKETS; ++i) {
-		printf("\tbucket %d\n", i);
 		node *curr = cache_buckets[i];
 		while (curr) {
 			if (curr->data->file_name) {
-				printf("\t\t%s:%d\n", curr->data->file_name, curr->reading);
+				printf("%s:%d,", curr->data->file_name, curr->reading);
 			}
 			curr = curr->next;
 		}
 	}
+	printf("\n");
 }
 
 /* LRU */
@@ -472,6 +540,8 @@ void lru_use(struct file_data *data)
 		}
 
 		while (curr) {
+			assert(curr->data);
+			assert(curr->data->file_name);
 			if (!strncmp(curr->data->file_name, data->file_name, len)) {
 				assert(!match);
 				match = curr;
@@ -500,12 +570,14 @@ void lru_use(struct file_data *data)
 
 void lru_print()
 {
-	printf("lru\n");
+	printf("%d|lru\n%d|\t", pthread_t_to_small_int(pthread_self()),
+		   pthread_t_to_small_int(pthread_self()));
 	lru_node *n = lru_list_head;
 	while (n) {
-		printf("\t\t%s\n", n->data->file_name);
+		printf("%s,", n->data->file_name);
 		n = n->next;
 	}
+	printf("\n");
 }
 
 /* circular Q implementation */
@@ -537,7 +609,7 @@ void q_print(const circular_q *q)
 {
 	unsigned i = q->start;
 	while (i != q->end) {
-		printf("%d ", q->q[i]);
+		printf("%d|%d ", pthread_t_to_small_int(pthread_self()), q->q[i]);
 		i = (i + 1) % q->max_q_size_plus_one;
 	}
 	printf("\n");
@@ -560,69 +632,11 @@ int q_deq(circular_q *q)
 	return ret;
 }
 
-/*
-	pthread_mutex_lock(&cache_lock);
-	node *cached = cache_lookup_or_insert(data);
-	if (cached->data->file_buf) {
-		cached->reading = 1;
-		lru_use(cached->data);
-		pthread_mutex_unlock(&cache_lock);
+/* */
 
-		file_data_free(data);
-		rq->data = cached->data;
-
-		request_sendfile(rq);
-
-		pthread_mutex_lock(&cache_lock);
-		cached->reading = 0;
-		pthread_mutex_unlock(&cache_lock);
-	} else {
-		// read into another data struct
-		struct file_data *f = file_data_init();
-		f->file_name = cached->data->file_name;
-		rq->data = f;
-		cached->reading = 1;
-		pthread_mutex_unlock(&cache_lock);
-
-		ret = request_readfile(rq);
-
-		if (ret) {
-			pthread_mutex_lock(&cache_lock);
-			cached->reading = 0;
-
-			int file_too_big_for_cache = rq->data->file_size > sv->max_cache_size;
-			int evict_amount = cache_usage + rq->data->file_size - sv->max_cache_size;
-
-			if (!file_too_big_for_cache && evict_amount > 0) {
-				// adding would overfill cache, need to evict
-				if (cache_evict(evict_amount) > 0) {
-					// still have to evict but can't due to reading files
-					file_too_big_for_cache = 1;
-				}
-			}
-
-			if (!file_too_big_for_cache) {
-				cached->reading = 1;
-				cached->data->file_buf = rq->data->file_buf;
-				lru_use(cached->data);
-			}
-			pthread_mutex_unlock(&cache_lock);
-
-			request_sendfile(rq);
-
-			pthread_mutex_lock(&cache_lock);
-			if (!file_too_big_for_cache) {
-				cached->reading = 0;
-				cached->data->file_size = rq->data->file_size;
-				cache_usage += rq->data->file_size;
-				free(f);
-			} else {
-				ret = cache_delete(data);
-				assert(ret == 0);
-			}
-			pthread_mutex_unlock(&cache_lock);
-		} else {
-			assert(0);
-		}
-	}
-*/
+int pthread_t_to_small_int(pthread_t pt)
+{
+	int i = 0;
+	while (threads[i++] != pt);
+	return i;
+}
