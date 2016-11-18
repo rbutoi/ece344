@@ -61,11 +61,16 @@ int pthread_t_to_small_int(pthread_t pt);
     if (X) memset(X, 0, strlen(X));             \
     free(X);                                    \
     X = NULL;
+
 #ifdef DEBUG
 #define DEBUG_PRINT(FMT, ...)											\
 printf("%d|" FMT "\n", pthread_t_to_small_int(pthread_self()), __VA_ARGS__)
+#define FREE(X) ZEROING_FREE(X)
+#define FREE_STR(X) ZEROING_FREE_STR(X)
 #else
 #define DEBUG_PRINT(FMT, ...)
+#define FREE(X) free(X)
+#define FREE_STR(X) free(X)
 #endif
 
 /* globals */
@@ -109,12 +114,15 @@ file_data_init(void)
 static void
 file_data_free(struct file_data *data)
 {
-	ZEROING_FREE_STR(data->file_name);
+	FREE_STR(data->file_name);
+#ifdef DEBUG
 	if (data->file_buf) {
 		memset(data->file_buf, 0, data->file_size);
 	}
+#endif
 	free(data->file_buf);
-	ZEROING_FREE(data);
+
+	FREE(data);
 }
 
 static void
@@ -156,7 +164,7 @@ do_server_request(struct server *sv, int connfd)
 		assert(cached->reading > 0);
 		--cached->reading;
 
-		ZEROING_FREE(data);
+		FREE(data);
 
 		pthread_mutex_unlock(&cache_lock);
 	} else {
@@ -420,7 +428,7 @@ cache_delete(struct file_data *data)
 		node *sacrificial = *head;
 		*head = (*head)->next;
 		file_data_free(sacrificial->data);
-		ZEROING_FREE(sacrificial);
+		FREE(sacrificial);
 	} else {
 		node *prev = *head;
 		node *curr = prev->next;
@@ -443,7 +451,7 @@ cache_delete(struct file_data *data)
 		cache_usage -= curr->data->file_size;
 		deleted = curr->data->file_size;
 		file_data_free(curr->data);
-		ZEROING_FREE(curr);
+		FREE(curr);
 	}
 
 	return deleted;
@@ -460,7 +468,7 @@ int cache_evict(int amount)
 		amount -= deleted;
 		lru_node *sacrificial = lru_list_head;
 		lru_list_head = lru_list_head->next;
-		ZEROING_FREE(sacrificial);
+		FREE(sacrificial);
 	}
 
 	/* if successfully evicted from head, or evicted everything from head */
@@ -485,7 +493,7 @@ int cache_evict(int amount)
 			curr = curr->next;
 			prev->next = curr;
 
-			ZEROING_FREE(sacrificial);
+			FREE(sacrificial);
 		} else {
 			prev = prev->next;
 			curr = curr->next;
