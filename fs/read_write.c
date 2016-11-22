@@ -48,12 +48,36 @@ testfs_read_data(struct inode *in, char *buf, off_t start, size_t size)
 	if (start + (off_t) size > in->in.i_size) {
 		size = in->in.i_size - start;
 	}
-	if (block_ix + size > BLOCK_SIZE) {
-		TBD();
+	if (block_ix + size <= BLOCK_SIZE) {
+		/* just copy one block */
+		if ((ret = testfs_read_block(in, block_nr, block)) < 0)
+			return ret;
+		memcpy(buf, block + block_ix, size);
+	} else {
+		/* copy multiple blocks */
+		long first_block = block_nr;
+		long last_block = (start + size) / BLOCK_SIZE;
+
+		long copied;
+		/* copy first */
+		if ((ret = testfs_read_block(in, first_block, block)) < 0)
+			return ret;
+		memcpy(buf, block + block_ix, (copied = BLOCK_SIZE - block_ix));
+
+		/* copy middle, full blocks */
+		long i;
+		for (i = first_block + 1; i < last_block; ++i) {
+			if ((ret = testfs_read_block(in, i, block)) < 0)
+				return ret;
+			memcpy(buf + copied, block + copied, BLOCK_SIZE);
+			copied += BLOCK_SIZE;
+		}
+
+		/* copy last */
+		if ((ret = testfs_read_block(in, last_block, block)) < 0)
+			return ret;
+		memcpy(buf + copied, block, size - copied);
 	}
-	if ((ret = testfs_read_block(in, block_nr, block)) < 0)
-		return ret;
-	memcpy(buf, block + block_ix, size);
 	/* return the number of bytes read or any error */
 	return size;
 }
@@ -123,17 +147,48 @@ testfs_write_data(struct inode *in, const char *buf, off_t start, size_t size)
 	char block[BLOCK_SIZE];
 	long block_nr = start / BLOCK_SIZE;
 	long block_ix = start % BLOCK_SIZE;
+	u64 max_file_size = ((u64) NR_DIRECT_BLOCKS + NR_INDIRECT_BLOCKS +
+	                     NR_INDIRECT_BLOCKS * NR_INDIRECT_BLOCKS) * BLOCK_SIZE;
 	int ret;
 
-	if (block_ix + size > BLOCK_SIZE) {
-		TBD();
+	if (block_ix + size <= BLOCK_SIZE) {
+		/* write to single block */
+
+		/* ret is the newly allocated physical block number */
+		if ((ret = testfs_allocate_block(in, block_nr, block)) < 0)
+			return ret;
+		memcpy(block + block_ix, buf, size);
+		write_blocks(in->sb, block, ret, 1);
+	} else if ((u64) (start + size) > max_file_size) {
+		return -EFBIG;
+	} else {
+		/* write across multiple blocks */
+		long first_block = block_nr;
+		long last_block = (start + size) / BLOCK_SIZE;
+
+		long written;
+		/* write first */
+		if ((ret = testfs_allocate_block(in, block_nr, block)) < 0)
+			return ret;
+		memcpy(block + block_ix, buf, (written = BLOCK_SIZE - block_ix));
+		write_blocks(in->sb, block, ret, 1);
+
+		/* write middle, full blocks */
+		long i;
+		for (i = first_block + 1; i < last_block; ++i) {
+			if ((ret = testfs_allocate_block(in, i, block)) < 0)
+				return ret;
+			memcpy(block, buf + written, BLOCK_SIZE);
+			write_blocks(in->sb, block, ret, 1);
+			written += BLOCK_SIZE;
+		}
+
+		/* write last */
+		if ((ret = testfs_allocate_block(in, last_block, block)) < 0)
+			return ret;
+		memcpy(block, buf + written, size - written);
+		write_blocks(in->sb, block, ret, 1);
 	}
-	/* ret is the newly allocated physical block number */
-	ret = testfs_allocate_block(in, block_nr, block);
-	if (ret < 0)
-		return ret;
-	memcpy(block + block_ix, buf, size);
-	write_blocks(in->sb, block, ret, 1);
 	/* increment i_size by the number of bytes written. */
 	if (size > 0)
 		in->in.i_size = MAX(in->in.i_size, start + (off_t) size);
