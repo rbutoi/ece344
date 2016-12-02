@@ -158,6 +158,7 @@ testfs_allocate_block(struct inode *in, int log_block_nr, char *block)
 
 		int indirect_allocated = 0;
 		long idx_in_dindirect = log_block_nr / NR_INDIRECT_BLOCKS;
+		assert(idx_in_dindirect < NR_INDIRECT_BLOCKS);
 		long indirect_block = ((int *)buf)[idx_in_dindirect];
 		if (!indirect_block) {
 			/* must needs alloc an indirect block */
@@ -239,8 +240,8 @@ testfs_write_data(struct inode *in, const char *buf, off_t start, size_t size)
 
 			if ((ret = testfs_allocate_block(in, block_nr, block)) < 0)
 				return ret;
-			long to_write = MIN((unsigned) (size - written), (unsigned) (BLOCK_SIZE - block_ix));
-			if ((unsigned) (start + written) > max_file_size) {
+			long to_write = MIN((signed) (size - written), (signed) (BLOCK_SIZE - block_ix));
+			if ((unsigned) (start + written + to_write) > max_file_size) {
 				return -EFBIG;
 			}
 
