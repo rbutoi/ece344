@@ -29,9 +29,11 @@ testfs_read_block(struct inode *in, int log_block_nr, char *block)
 			assert(log_block_nr >= 0);
 
 			read_blocks(in->sb, block, in->in.i_dindirect, 1);
-			int indirect_block_phy_nr = ((int *)block)[log_block_nr / NR_INDIRECT_BLOCKS];
-			read_blocks(in->sb, block, indirect_block_phy_nr, 1);
-			phy_block_nr = ((int *)block)[log_block_nr % NR_INDIRECT_BLOCKS];
+			phy_block_nr = ((int *)block)[log_block_nr / NR_INDIRECT_BLOCKS];
+			if (phy_block_nr) {
+				read_blocks(in->sb, block, phy_block_nr, 1);
+				phy_block_nr = ((int *)block)[log_block_nr % NR_INDIRECT_BLOCKS];
+			}
 		}
 	}
 	if (phy_block_nr > 0) {
@@ -296,7 +298,7 @@ testfs_free_blocks(struct inode *in)
 		for (i = 0; i < NR_INDIRECT_BLOCKS; ++i) {
 			if (((int *)block)[i]) {
 				read_blocks(in->sb, indirect_block, ((int *)block)[i], 1);
-				for (j = 0; (i * NR_INDIRECT_BLOCKS + j) < e_block_nr && i < NR_INDIRECT_BLOCKS; ++j) {
+				for (j = 0; (i * NR_INDIRECT_BLOCKS + j) < e_block_nr && j < NR_INDIRECT_BLOCKS; ++j) {
 					if (((int *)indirect_block)[j]) {
 						testfs_free_block_from_inode(in, ((int *)indirect_block)[j]);
 						((int *)indirect_block)[j] = 0;
